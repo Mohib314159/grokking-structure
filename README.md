@@ -1,15 +1,5 @@
 # Group structure and the grokking clock
 
-> **Status.** This is a pilot, not a settled result. The central claim is
-> supported at p = 0.018 (exact, one-sided, n = 8 groups). An earlier version
-> of this repo claimed that quaternionic-type groups "never grok"; that claim
-> was **false** and is corrected below -- they grok at higher train fraction.
-> A second claim about order-16 groups at high train fraction was **retracted**
-> because the validation set was as small as 8 examples. Both are documented in
-> CORRECTIONS.md rather than quietly removed. Everything in the Mechanism
-> section is measured at train fraction 0.70, which is below the critical
-> dataset size for the quaternionic groups and above it for the controls.
-
 Does the representation theory of a finite group determine when a neural
 network groks its composition table? Recent delay laws predict grokking time
 from optimisation quantities (weight decay, learning rate, norm ratios) but
