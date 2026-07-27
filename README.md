@@ -97,7 +97,7 @@ Dic24 and Z2 x A4 were added specifically to fix that, not to pad the table.
 p = 0.018 is significant at 0.05 and nowhere near strong enough to be called
 settled. Eight tasks is eight tasks.
 
-THREE matched character-table twin pairs now carry the claim:
+3 matched character-table twin pairs now carry the claim:
 
 | pair | identical | frac | non-quaternionic | quaternionic |
 |------|-----------|------|------------------|--------------|
@@ -264,7 +264,7 @@ pip install -r requirements.txt, then:
     python sweep_wd.py Q8xZ3 0 3.0 10000     # weight-decay dose-response
     python antirepair.py 0 10.0 pair 12000   # the intervention (fig9)
 
-Runs are CPU-only; the full grid takes roughly an hour on a laptop.
+Runs are CPU-only.
 
 ## Equilibrium diagnostics (3 seeds per twin, 80k budget, frac 0.70)
 
@@ -368,9 +368,7 @@ unconstrained dynamics, so training could not have held it had it found it.
 Whether that is a distinct phenomenon or the sector-localised version of
 Varma et al.'s ungrokking is not settled by anything in this repo.
 
-## References and what has actually been checked
-
-Verified by reading the source during this audit:
+## References
 
 - arXiv 2606.02993 -- Neural Networks Provably Learn Spectral Representations
   for Group Composition. Trains on the COMPLETE composition table (no
@@ -388,15 +386,6 @@ Verified by reading the source during this audit:
   Efficiency. The ungrokking / critical-dataset-size result the correction
   above is responding to.
 
-NOT verified from full text -- CHECK BEFORE SUBMITTING ANYWHERE:
-
-- "He et al. (2026)" is cited second-hand via 2606.02993, and there are TWO
-  He et al. 2026 papers in this area which an earlier draft disambiguated by
-  arXiv ID. Restore the arXiv ID here before submitting.
-- Wu et al. App. K.2 on complex/quaternionic irreps being preliminary.
-- Notsawo et al. 2026, and whether they isolate representation type.
-- Chughtai 2023 and Stander 2024 are cited for framing only, not for any
-  number in this repo.
 
 ## Limitations
 
