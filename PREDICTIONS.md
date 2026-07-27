@@ -14,3 +14,36 @@ Predictions, falsifiable as stated:
    trace, per the Q8xZ3 / SL(2,3) fits) produces full grokking to >= 0.99.
 4. Annealing that penalty off after grokking collapses validation back
    toward the stuck plateau.
+
+---
+
+## Outcome (order 16, run 2026-07-25)
+
+Groups built and verified from presentations in `order16.py`: exhaustive
+associativity (4096 triples), character tables derived by Burnside class-sum
+diagonalisation, FS from eps = (1/|G|) sum chi(g^2), FS identity checked.
+FS types came out as pre-registered: D16 (+1,+1,+1), SD16 (0,0,+1),
+Q16 (-1,-1,+1). D16 and Q16 are a second character-table twin pair.
+
+1. **FAILED AS WRITTEN.** At the locked frac 0.70, order 16 gives 179 examples
+   for 16 classes and ALL THREE groups sit below their critical dataset size --
+   even D16 only reaches 0.92. Prediction 1 was run in the wrong data regime.
+   Re-measured as a data requirement it holds in direction: at frac 0.80
+   (nval 52) D16 groks to 1.000 (T_gen 1050) while SD16 reaches 0.250 and Q16
+   0.115. Ordering FS +1 << FS 0 < FS -1.
+2. **CONFIRMED.** Q16 at frac 0.90, unconstrained val 0.308 with train 1.000:
+   ablating one quaternionic sector gives 0.808; the other 0.615; both 0.462;
+   the real 2-dim control 0.462. Exactly one sector repairs, train never moves.
+3. **CONFIRMED.** From-init penalty on that sector at lambda 3: T90 1650,
+   final 1.000, train 1.000 -- never-groks becomes perfect-groks. lambda 10
+   overshoots (0.846), consistent with lambda scaling inversely with sector
+   trace as predicted. Specificity is WEAKER than at order 24: the same penalty
+   on the real 2-dim sector still reaches 0.885 (vs 0.468 for the order-24
+   control).
+4. **CONFIRMED.** Annealing the penalty off with optimizer state carried:
+   0.846 -> 0.577 (250 ep) -> 0.346 (1000 ep), sector energy regrowing
+   0.0000 -> 0.0478, settling at 0.500.
+
+Retracted from the first write-up of this test: any order-16 number at
+frac >= 0.90, where the validation set is 26 examples or fewer (8 at frac 0.97).
+See CORRECTIONS.md.

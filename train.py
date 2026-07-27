@@ -26,7 +26,7 @@ def sustained_crossing(vals, epochs, thresh, window=5):
     return None
 
 def run_one(group_name, seed, frac=0.7, width=512, lr=2e-3, wd=1.0,
-            max_epochs=150_000, eval_every=50, verbose_every=5000):
+            max_epochs=80_000, eval_every=50, verbose_every=5000):
     T, inv = get_group(group_name)
     n = inv["n"]
 
@@ -98,6 +98,7 @@ def run_one(group_name, seed, frac=0.7, width=512, lr=2e-3, wd=1.0,
         sq_final = hist["sqnorm"][-1]
 
     out = dict(group=group_name, seed=seed, frac=frac, width=width, lr=lr, wd=wd,
+               max_epochs=max_epochs, eval_every=eval_every, gen_thresh=0.90,
                invariants={k: v for k, v in inv.items() if k != "irrep_dims"},
                irrep_dims=inv["irrep_dims"],
                T_mem=T_mem, T_gen=T_gen, delay=delay,
