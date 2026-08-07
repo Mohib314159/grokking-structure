@@ -1,21 +1,339 @@
-MIT License
+"""
+core.py -- batched trainer and readout tooling. Torch, GPU if you have one.
 
-Copyright (c) 2026 Mohib (github.com/Mohib314159)
+SPEED NOTES (these are the reasons this is ~20-40x the original per run)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+  1. The input is one-hot(a) concat one-hot(b), so the first layer is NOT a
+     (403,48)@(48,512) matmul -- it is a gather. We do it as a precomputed
+     sparse selector matmul S^T @ AB, which on CPU beat both torch's index
+     path and a dense 48-dim matmul in benchmarking. On GPU either is fine.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+  2. Every run in a sweep has identical tensor shapes (|G|=24, 403 train,
+     173 val, width 512). So R runs become ONE batched bmm instead of R small
+     ones, which is the difference between a BLAS call that uses the machine
+     and one that doesn't. AdamW is elementwise and batches for free.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+  3. Per-run weight decay is a length-R vector, so a whole lambda_train
+     factorial is one batched job rather than six sequential ones.
+
+  4. AdamW with foreach=True (CPU) / fused=True (CUDA).
+
+  5. Evaluation on a log-spaced grid. Nothing moves after ~30k epochs; there
+     is no reason to sample it densely.
+
+  6. The ridge probe eigendecomposes the Gram matrix ONCE and reuses it across
+     the whole lambda grid. exp5_readout.py rebuilt H^T H for each of 13
+     lambdas, at every checkpoint.
+
+CORRECTNESS NOTE. Batching R runs into one cross-entropy divides every
+gradient by R. Adam is scale-invariant except through eps=1e-8, and decoupled
+weight decay does not see the gradient at all, so batched and sequential runs
+agree to optimiser noise. This is the same argument the repo's exp2_fast.py
+already relies on; it is stated here because a referee will ask.
+"""
+import math
+import os
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+import groups24 as G24
+
+
+# ------------------------------------------------------------------ device
+
+def pick_device(prefer_gpu=True, threads=None):
+    if prefer_gpu and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        return torch.device("cuda")
+    n = threads or int(os.environ.get("GS_THREADS", 0)) or (os.cpu_count() or 4)
+    torch.set_num_threads(max(1, n))
+    return torch.device("cpu")
+
+
+# -------------------------------------------------------------------- data
+
+def make_run_data(group, split_seed, frac, relabel_seed=None):
+    """Returns (a, b, y) for train and val. `relabel_seed` applies a random
+    isomorphism of the group before building the table (see groups24.relabel
+    for why this is distributionally the same as resampling the split)."""
+    T = G24.cayley(group)
+    n = T.shape[0]
+    if relabel_seed is not None:
+        rng = np.random.RandomState(900_000 + relabel_seed)
+        T = G24.relabel(T, rng.permutation(n))
+    a = np.repeat(np.arange(n), n)
+    b = np.tile(np.arange(n), n)
+    y = T[a, b]
+    rng = np.random.RandomState(split_seed)
+    perm = rng.permutation(n * n)
+    k = int(frac * n * n)
+    tr, va = perm[:k], perm[k:]
+    return (a[tr], b[tr], y[tr]), (a[va], b[va], y[va]), n
+
+
+# ----------------------------------------------------------------- trainer
+
+class Batch:
+    """R independent one-hidden-layer MLPs trained in lockstep.
+
+    runs: list of dicts with keys
+        group, split_seed, init_seed, and optionally relabel_seed, wd
+    """
+
+    def __init__(self, runs, frac=0.70, width=512, lr=2e-3, wd=1.0,
+                 betas=(0.9, 0.98), eps=1e-8, device=None, dtype=torch.float32):
+        self.runs = list(runs)
+        self.R = len(self.runs)
+        self.width = width
+        self.lr = lr
+        self.dev = device or pick_device()
+        self.dtype = dtype
+
+        AT, BT, YT, AV, BV, YV, AB0, W20, WD = [], [], [], [], [], [], [], [], []
+        for r in self.runs:
+            (at, bt, yt), (av, bv, yv), n = make_run_data(
+                r["group"], r["split_seed"], frac, r.get("relabel_seed"))
+            AT.append(at); BT.append(bt); YT.append(yt)
+            AV.append(av); BV.append(bv); YV.append(yv)
+            g = torch.Generator().manual_seed(int(r["init_seed"]))
+            b1 = 1.0 / math.sqrt(2 * n)
+            b2 = 1.0 / math.sqrt(width)
+            # matches nn.Linear default: U(-1/sqrt(fan_in), 1/sqrt(fan_in))
+            AB0.append((torch.rand(2 * n, width, generator=g) * 2 - 1) * b1)
+            W20.append((torch.rand(n, width, generator=g) * 2 - 1) * b2)
+            WD.append(float(r.get("wd", wd)))
+        self.n = n
+        self.Ntr, self.Nva = len(AT[0]), len(AV[0])
+
+        dev, dt = self.dev, dtype
+        self.yt = torch.tensor(np.stack(YT), device=dev, dtype=torch.long)
+        self.yv = torch.tensor(np.stack(YV), device=dev, dtype=torch.long)
+        self.AB = torch.stack(AB0).to(dev, dt).requires_grad_(True)  # (R,2n,W)
+        self.W2 = torch.stack(W20).to(dev, dt).requires_grad_(True)  # (R,n,W)
+        self.wd = torch.tensor(WD, device=dev, dtype=dt).view(-1, 1, 1)
+
+        # sparse selector: S[r] is (Ntr, 2n) one-hot for (a, n+b).
+        # h = relu(S @ AB) is the one-hot first layer done as one bmm.
+        def sel(A, B, N):
+            S = torch.zeros(self.R, N, 2 * n, device=dev, dtype=dt)
+            idx = torch.arange(N, device=dev)
+            for r in range(self.R):
+                S[r, idx, torch.tensor(A[r], device=dev)] = 1.0
+                S[r, idx, torch.tensor(B[r], device=dev) + n] = 1.0
+            return S
+        self.Str = sel(AT, BT, self.Ntr)
+        self.Sva = sel(AV, BV, self.Nva)
+
+        fused = (self.dev.type == "cuda")
+        self.opt = torch.optim.AdamW(
+            [self.AB, self.W2], lr=lr, betas=betas, eps=eps, weight_decay=0.0,
+            **({"fused": True} if fused else {"foreach": True}))
+
+    # ---- forward
+    def h_tr(self):
+        return torch.relu(torch.bmm(self.Str, self.AB))
+
+    def h_va(self):
+        return torch.relu(torch.bmm(self.Sva, self.AB))
+
+    def logits(self, H):
+        return torch.bmm(H, self.W2.transpose(1, 2))
+
+    @torch.no_grad()
+    def accs(self):
+        tr = (self.logits(self.h_tr()).argmax(-1) == self.yt).float().mean(-1)
+        va = (self.logits(self.h_va()).argmax(-1) == self.yv).float().mean(-1)
+        return tr.cpu().numpy(), va.cpu().numpy()
+
+    # ---- one full-batch step
+    def step(self):
+        logits = self.logits(torch.relu(torch.bmm(self.Str, self.AB)))
+        # Multiply by R so each run's gradient equals what it would be if that
+        # run were trained ALONE. Without this, cross_entropy averages over
+        # R*N examples and every run's gradient is scaled by 1/R. Adam is
+        # scale-invariant EXCEPT through eps: g -> g/R gives
+        #     m/(sqrt(v)+eps) = m/(sqrt(v) + R*eps),
+        # i.e. an effective eps of R*1e-8. At R=36 that is 3.6e-7, which is
+        # comparable to sqrt(v) late in training once gradients are small --
+        # exactly the phase this experiment measures. The repo's exp2_fast.py
+        # has the same issue.
+        loss = F.cross_entropy(logits.reshape(-1, self.n),
+                               self.yt.reshape(-1)) * self.R
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        # Decoupled weight decay, per-run. ORDER MATTERS AND IT IS torch's:
+        # torch.optim.AdamW computes the gradient at theta_t, THEN does
+        #     param.mul_(1 - lr*wd)
+        # and only then applies the Adam update. Decaying before the forward
+        # pass instead evaluates the gradient at (1 - lr*wd) * theta_t, which
+        # is a different algorithm. test_equivalence.py checks this batched
+        # trainer against a plain single-model torch.optim.AdamW run.
+        with torch.no_grad():
+            self.AB.mul_(1 - self.lr * self.wd)
+            self.W2.mul_(1 - self.lr * self.wd)
+        self.opt.step()
+        return float(loss.detach()) / self.R
+
+    # ---- diagnostics the paper does not report
+    @torch.no_grad()
+    def diagnostics(self):
+        Htr = self.h_tr()
+        Z = self.logits(Htr)
+        idx = torch.arange(self.Ntr, device=self.dev)
+        rr = torch.arange(self.R, device=self.dev).unsqueeze(1)
+        lse = torch.logsumexp(Z, -1)
+        ce = (lse - Z[rr, idx, self.yt]).mean(-1)
+        Zm = Z.clone()
+        Zm[rr, idx, self.yt] = -1e30
+        margin = (Z[rr, idx, self.yt] - Zm.max(-1).values).mean(-1)
+        return dict(
+            train_ce=ce.cpu().numpy(),
+            margin=margin.cpu().numpy(),
+            logit_scale=Z.abs().mean((1, 2)).cpu().numpy(),
+            W1_norm=self.AB.pow(2).sum((1, 2)).sqrt().cpu().numpy(),
+            W2_norm=self.W2.pow(2).sum((1, 2)).sqrt().cpu().numpy(),
+            h_norm=(Htr.pow(2).sum(-1).sqrt().mean(-1)).cpu().numpy(),
+            h_rank_eff=_participation(Htr).cpu().numpy(),
+        )
+
+
+@torch.no_grad()
+def _participation(H):
+    """Effective rank of the representation (participation ratio of the
+    covariance spectrum). Cheap stand-in for the manifold measures in
+    Chou et al. 2605.27078; reported so the two are comparable."""
+    Hc = H - H.mean(1, keepdim=True)
+    C = torch.bmm(Hc.transpose(1, 2), Hc) / Hc.shape[1]
+    ev = torch.linalg.eigvalsh(C).clamp_min(0)
+    return ev.sum(-1) ** 2 / (ev.pow(2).sum(-1) + 1e-30)
+
+
+# ------------------------------------------------------------------ probes
+
+@torch.no_grad()
+def ridge_family(H, y, n):
+    """Returns a closure lam -> W (n,d) from ONE eigendecomposition of H^T H.
+    Reusing it across the lambda grid is ~13x cheaper than re-solving."""
+    Hd = H.double()
+    Y = F.one_hot(y, n).double()
+    w, V = torch.linalg.eigh(Hd.T @ Hd)
+    VtR = V.T @ (Hd.T @ Y)
+    return lambda lam: (V @ (VtR / (w + lam).unsqueeze(1))).T
+
+
+@torch.no_grad()
+def probe(H_fit, y_fit, H_sel, y_sel, H_eval, n, lams=None, H_all=None, y_all=None):
+    """THE LEAK-FREE PROBE.
+
+    exp5_readout.py selected the retrained readout with
+        if va_a > best_va: best_va, best_W2 = va_a, W2_r
+    where va_a is VALIDATION accuracy -- it selected on the metric it then
+    reported, and the selected W2 also fed the sector transplants. Here the
+    ridge strength is chosen on a split held out from TRAIN, and the evaluation
+    set is touched once.
+
+    lambda is chosen on (H_fit, H_sel), then the probe is REFITTED on the whole
+    training split before evaluation. Without that refit the probe sees 20%
+    less data than the native readout it is compared against, which is a
+    data-quantity confound rather than a readout one. Pass H_all/y_all to get
+    the refit; if they are omitted the fit subset is used and the returned
+    `refit` flag is False, so a caller can tell which happened.
+
+    Returns (predictions on H_eval, chosen lam, inner-selection accuracy,
+    training accuracy of the final probe, refit flag).
+    """
+    lams = lams or [10.0 ** k for k in range(-6, 7)]
+    mk = ridge_family(H_fit, y_fit, n)
+    best, blam = -1.0, lams[0]
+    Hs = H_sel.double()
+    for lam in lams:
+        acc = float(((Hs @ mk(lam).T).argmax(-1) == y_sel).float().mean())
+        if acc > best:
+            best, blam = acc, lam
+    refit = H_all is not None
+    if refit:
+        W = ridge_family(H_all, y_all, n)(blam)
+        tr = float(((H_all.double() @ W.T).argmax(-1) == y_all).float().mean())
+    else:
+        W = mk(blam)
+        tr = float(((H_fit.double() @ W.T).argmax(-1) == y_fit).float().mean())
+    return (H_eval.double() @ W.T).argmax(-1), blam, best, tr, refit
+
+
+def retrain_readout(H_tr, y_tr, H_va, y_va, n, wd, steps=4000, lr=2e-3,
+                    betas=(0.9, 0.98), W0=None, seed=0, device=None):
+    """Retrain W2 alone on a frozen representation with the real objective.
+
+    weight_decay is handed to torch.optim.AdamW rather than applied by hand, so
+    this is AdamW by construction. W0=None means a fresh uniform init.
+    """
+    dev = device or H_tr.device
+    d = H_tr.shape[1]
+    if W0 is None:
+        g = torch.Generator().manual_seed(5000 + seed)
+        b = 1.0 / math.sqrt(d)
+        W = ((torch.rand(n, d, generator=g) * 2 - 1) * b).to(dev, H_tr.dtype)
+    else:
+        W = W0.detach().clone()
+    W.requires_grad_(True)
+    opt = torch.optim.AdamW([W], lr=lr, betas=betas, weight_decay=wd)
+    for _ in range(steps):
+        loss = F.cross_entropy(H_tr @ W.T, y_tr)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        tr = float(((H_tr @ W.T).argmax(-1) == y_tr).float().mean())
+        va = float(((H_va @ W.T).argmax(-1) == y_va).float().mean())
+    return W.detach(), tr, va
+
+
+# ------------------------------------------------------------- thresholds
+
+def sustained(vals, epochs, thresh, window=5):
+    v = np.asarray(vals)
+    for i in range(len(v) - window + 1):
+        if np.all(v[i:i + window] >= thresh):
+            return int(epochs[i])
+    return None
+
+
+def log_grid(max_ep, k=90):
+    p = np.unique(np.round(np.logspace(0, np.log10(max_ep), k))).astype(int)
+    return sorted(set([0] + p.tolist() + [max_ep]))
+
+
+# ------------------------------------------------------------------ stats
+
+def exact_ordering_p(ranked_names, positive_set):
+    """Exact one-sided probability that the |positive_set| named groups occupy
+    the bottom |positive_set| positions of the ranking, under exchangeability.
+    The unit of replication is the GROUP. Quoting run counts is
+    pseudoreplication and this function refuses to do it."""
+    from math import comb
+    k = len(positive_set)
+    bottom = set(ranked_names[:k])
+    return (1.0 / comb(len(ranked_names), k)) if bottom == set(positive_set) else None
+
+
+def permutation_test(values_by_group, positive, n_perm=200_000, seed=0):
+    """Group-level permutation test on the difference in mean rank between
+    quaternionic and non-quaternionic groups. Uses group means, so within-group
+    seeds do not inflate n. Returns (observed statistic, p)."""
+    names = sorted(values_by_group)
+    means = np.array([np.mean(values_by_group[g]) for g in names])
+    is_pos = np.array([g in positive for g in names])
+    obs = means[~is_pos].mean() - means[is_pos].mean()
+    rng = np.random.RandomState(seed)
+    k = is_pos.sum()
+    cnt = 0
+    for _ in range(n_perm):
+        idx = rng.permutation(len(names))[:k]
+        m = np.zeros(len(names), bool)
+        m[idx] = True
+        if means[~m].mean() - means[m].mean() >= obs:
+            cnt += 1
+    return float(obs), (cnt + 1) / (n_perm + 1)

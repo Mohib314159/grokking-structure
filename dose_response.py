@@ -1,101 +1,83 @@
-"""Dose-response: final val accuracy vs train fraction, all six groups.
+"""Two extra order-24 groups, added to fix the sample size of the main claim.
 
-Replaces the original grok / no-grok binary, which was threshold-sensitive and
--- worse -- confounded with the critical dataset size. Q8xZ3 does not "fail to
-grok"; it groks at frac >= 0.78. What representation type shifts is the DATA
-REQUIREMENT, and a dose-response curve is the right way to show that.
+With six groups the exact test on the FS ordering gives 1/C(6,2) = 0.067 --
+not significant. The unit of replication is the group, not the run, so more
+seeds do not help; more GROUPS do. Adding one quaternionic and one
+non-quaternionic group takes it to 1/C(8,3) = 0.018.
 
-Fixed budget (9k epochs, eval every 100) at every fraction so the points are
-comparable. 2 seeds per cell.
+  Dic24  dicyclic of order 24: <a,b | a^12=e, b^2=a^6, b a b^-1 = a^-1>
+         q-mass 1/2. Shares its ENTIRE character table with D12 -- a third
+         character-table twin pair, and the sharpest one in the study, since
+         D12 is the fastest-grokking group here.
+  Z2xA4  direct product, q-mass 0, 8 classes, dims [1x6, 3x2].
 
-    python dose_response.py          # run the sweep -> results/dose_response.json
-    python dose_response.py --plot   # figure only, from stored results
+Both verified from first principles by verify_math-style checks: exhaustive
+associativity (13824 triples), character table by Burnside class-sum
+diagonalisation, FS from eps = (1/|G|) sum chi(g^2), FS identity.
 """
-import json, os, sys
+import itertools
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-FRACS = (0.50, 0.60, 0.70)
-SEEDS = (0, 1)
-BUDGET, EVERY = 9000, 100
-ORDER = ["Z24", "D12", "D4xZ3", "S4", "Z2xA4", "Q8xZ3", "Dic24", "SL23"]
-QMASS = {"Z24": 0.0, "D12": 0.0, "D4xZ3": 0.0, "S4": 0.0, "Z2xA4": 0.0,
-         "Q8xZ3": 1/6, "Dic24": 0.5, "SL23": 1/6}
-LABEL = {"Z24": "Z$_{24}$", "D12": "D$_{12}$", "S4": "S$_4$",
-         "D4xZ3": "D$_4{\\times}$Z$_3$", "Q8xZ3": "Q$_8{\\times}$Z$_3$", "SL23": "SL(2,3)",
-         "Z2xA4": "Z$_2{\\times}$A$_4$", "Dic24": "Dic$_{24}$"}
-OUT = "results/dose_response.json"
 
 
-def sweep():
-    from train import run_one
-    import torch
-    torch.set_num_threads(1)
-    res = json.load(open(OUT)) if os.path.exists(OUT) else {}
-    for f in FRACS:
-        for g in ORDER:
-            for s in SEEDS:
-                k = f"{g}|{f}|{s}"
-                if k in res:
-                    continue
-                r = run_one(g, s, frac=f, max_epochs=BUDGET, eval_every=EVERY,
-                            verbose_every=10 ** 9)
-                res[k] = [r["T_gen"], r["final_val_acc"]]
-                print(f"{g:7s} frac {f} seed {s}  final {r['final_val_acc']:.3f}", flush=True)
-                json.dump(res, open(OUT, "w"))
-    return res
+def cayley_Dic24():
+    T = np.zeros((24, 24), dtype=int)
+    for i, j in itertools.product(range(12), range(2)):
+        for k, l in itertools.product(range(12), range(2)):
+            m = (i + (k if j == 0 else -k) + (6 if j + l >= 2 else 0)) % 12
+            T[i + 12 * j, k + 12 * l] = m + 12 * ((j + l) % 2)
+    return T
 
 
-def plot(res):
-    fig, ax = plt.subplots(figsize=(7.4, 4.6))
-    for g in ORDER:
-        ys = [np.mean([res[f"{g}|{f}|{s}"][1] for s in SEEDS]) for f in FRACS]
-        lo = [min(res[f"{g}|{f}|{s}"][1] for s in SEEDS) for f in FRACS]
-        hi = [max(res[f"{g}|{f}|{s}"][1] for s in SEEDS) for f in FRACS]
-        quat = QMASS[g] > 0
-        ax.plot(FRACS, ys, "o-" if not quat else "s--",
-                color="C3" if quat else "C0", lw=2.0 if quat else 1.4,
-                ms=6, label=f"{LABEL[g]}" + ("  (quaternionic)" if quat else ""))
-        ax.fill_between(FRACS, lo, hi, color="C3" if quat else "C0", alpha=0.10)
-        ax.annotate(LABEL[g], (FRACS[-1], ys[-1]), textcoords="offset points",
-                    xytext=(6, -3), fontsize=8,
-                    color="C3" if quat else "C0")
-    ax.axhline(1 / 24, color="0.5", ls=":", lw=1)
-    ax.text(0.505, 1 / 24 + 0.012, "chance (1/24)", fontsize=7.5, color="0.4")
-    ax.set_xlabel("train fraction of the 576 composition pairs")
-    ax.set_ylabel("final validation accuracy (9k epochs)")
-    ax.set_xlim(0.485, 0.735)
-    ax.set_ylim(-0.02, 1.05)
-    ax.set_xticks(FRACS)
-    ax.legend(fontsize=8, loc="upper left")
-    ax.set_title("Quaternionic representation type raises the data requirement\n"
-                 "solid = FS type real/complex only, dashed = contains a quaternionic irrep",
-                 fontsize=10)
-    fig.tight_layout()
-    fig.savefig("figs/fig10_dose_response.png", dpi=160)
-    print("wrote figs/fig10_dose_response.png")
+def cayley_Z2xA4():
+    perms = [p for p in itertools.permutations(range(4))
+             if sum(1 for a in range(4) for b in range(a + 1, 4) if p[a] > p[b]) % 2 == 0]
+    idx = {p: i for i, p in enumerate(perms)}
+    T = np.zeros((24, 24), dtype=int)
+    for a, x in itertools.product(range(12), range(2)):
+        for b, y in itertools.product(range(12), range(2)):
+            pa, pb = perms[a], perms[b]
+            T[a + 12 * x, b + 12 * y] = idx[tuple(pa[pb[i]] for i in range(4))] + 12 * ((x + y) % 2)
+    return T
 
-    from math import comb
-    print("\n=== separation check ===")
-    for f in FRACS:
-        nq = [res[f"{g}|{f}|{s}"][1] for g in ORDER if QMASS[g] == 0 for s in SEEDS]
-        q = [res[f"{g}|{f}|{s}"][1] for g in ORDER if QMASS[g] > 0 for s in SEEDS]
-        print(f"  frac {f}: non-quaternionic [{min(nq):.3f}, {max(nq):.3f}] "
-              f"(n={len(nq)})  vs  quaternionic [{min(q):.3f}, {max(q):.3f}] "
-              f"(n={len(q)})   "
-              f"{'SEPARATED' if min(nq) > max(q) else 'OVERLAP'}")
-    nQ = sum(1 for g in ORDER if QMASS[g] > 0)
-    p = 1 / comb(len(ORDER), nQ)
-    print(f"\n  Unit of replication is the GROUP, not the run: seeds and fractions\n"
-          f"  resample the same {len(ORDER)} tasks, so quoting run counts is\n"
-          f"  pseudoreplication. Exact one-sided test:\n"
-          f"    P(the {nQ} quaternionic groups are the bottom {nQ} of {len(ORDER)} "
-          f"by chance) = 1/C({len(ORDER)},{nQ}) = {p:.4f}"
-          f"   {'SIGNIFICANT at 0.05' if p < 0.05 else 'NOT significant'}")
+
+EXTRA = {
+    "Dic24": (cayley_Dic24, dict(n=24, k=9, irrep_dims=[1, 1, 1, 1, 2, 2, 2, 2, 2],
+                                 fs=[1, 1, 1, 1, -1, -1, -1, 1, 1], quaternionic_mass=0.5)),
+    "Z2xA4": (cayley_Z2xA4, dict(n=24, k=8, irrep_dims=[1, 1, 1, 1, 1, 1, 3, 3],
+                                 fs=[0, 0, 0, 0, 1, 1, 1, 1], quaternionic_mass=0.0)),
+}
+
+
+def install():
+    """Monkeypatch groups.get_group so train.py can use these without edits."""
+    import groups, train
+    orig = groups.get_group
+
+    def get_group(name):
+        if name in EXTRA:
+            build, inv = EXTRA[name]
+            return build(), inv
+        return orig(name)
+    groups.get_group = get_group
+    train.get_group = get_group
+    return get_group
 
 
 if __name__ == "__main__":
-    res = json.load(open(OUT)) if "--plot" in sys.argv else sweep()
-    plot(res)
+    from order16 import assoc, char_table, fs, ident, order_profile
+    for name, (build, inv) in EXTRA.items():
+        T = build()
+        ok, nt = assoc(T)
+        chars, dims, cls, cls_of, sizes = char_table(T)
+        eps = np.round(fs(T, chars, cls_of).real).astype(int)
+        e = ident(T)
+        sq = sum(1 for g in range(24) if T[g, g] == e)
+        lhs = int(sum(d * ep for d, ep in zip(dims, eps)))
+        qm = sum(d * d for d, ep in zip(dims, eps) if ep == -1) / 24
+        print(f"{name}: assoc {'PASS' if ok else 'FAIL'} ({nt} triples)  "
+              f"classes {len(cls)}  dims {sorted(dims.tolist())}")
+        print(f"   FS {sorted(zip(dims.tolist(), eps.tolist()))}")
+        print(f"   sum eps*d = {lhs}, #\u007bg:g^2=e\u007d = {sq}  "
+              f"{'PASS' if lhs == sq else 'FAIL'}   q-mass {qm:.4f}")
+        print(f"   element orders {order_profile(T)}")
+        assert qm == inv["quaternionic_mass"], f"{name}: q-mass mismatch"

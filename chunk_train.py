@@ -1,230 +1,213 @@
-"""Aggregate results, recompute delays at a uniform threshold (0.90),
-verify Frobenius-Schur bookkeeping, and generate figures."""
-import glob
+"""Why does cleanup fail? Mechanism diagnostics on the stuck twin.
+
+Measurements on a trained (stuck) Q8xZ3 net vs the grokked D4xZ3 control:
+  1. Full sector x {val,train} ablation matrix (no post-hoc villain choice).
+  2. Gradient balance: cosine( P-projected dL_train/dW , P-projected W ).
+     Decoupled wd shrinks every direction at rate lr*wd (half-life ~350 ep
+     at lr=2e-3, wd=1), so a sector that keeps its norm for 40k epochs must
+     be actively regrown by the train-loss gradient. Negative cosine =
+     loss-gradient opposes shrinkage = the sector is load-bearing for TRAIN.
+  3. Train accuracy of the repaired net: does the villain exist to fix
+     residual train examples the structured solution cannot reach?
+  4. Neuron-mediated sector coupling matrix M[s,t] = sum_h a_s(h) b_t(h):
+     how much villain input-energy feeds load-bearing output-energy through
+     shared hidden neurons (why internal cleanup is expensive but external
+     projection is free).
+  5. Regrowth: project the villain out, resume training, watch its energy.
+"""
 import json
+import time
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+
 from groups import get_group
+from ablate import build_pair_projector
 
-THRESH = 0.90          # uniform generalisation threshold
-SUSTAIN = 5
-ORDER = ["Z24", "D12", "SL23", "S4", "D4xZ3", "Q8xZ3"]
-LABEL = {"Z24": "Z$_{24}$", "D12": "D$_{12}$", "SL23": "SL(2,3)", "S4": "S$_4$",
-         "D4xZ3": "D$_4{\\times}$Z$_3$", "Q8xZ3": "Q$_8{\\times}$Z$_3$"}
+torch.set_num_threads(4)
 
-# Frobenius-Schur indicator per irrep (hardcoded, verified below):
-#   +1 real, 0 complex, -1 quaternionic
-FS = {
-    "Z24":  [+1 if k in (0, 12) else 0 for k in range(24)],       # dims all 1
-    "D12":  [+1] * 9,                                             # dihedral: all real
-    "SL23": [+1, 0, 0, -1, 0, 0, +1],                             # dims 1,1,1,2,2,2,3
-    "S4":   [+1] * 5,                                             # symmetric: all real
-    "Q8xZ3": [+1, 0, 0] * 4 + [-1, 0, 0],                         # dims 1x12, 2x3
-    "D4xZ3": [+1, 0, 0] * 4 + [+1, 0, 0],                         # identical char table to Q8xZ3
-}
 
-def sustained(vals, epochs, thresh, window=SUSTAIN):
-    v = np.asarray(vals)
-    for i in range(len(v) - window + 1):
-        if np.all(v[i:i + window] >= thresh):
-            return int(epochs[i])
-    return None
+def make_data(group_name, seed, frac=0.7):
+    T, inv = get_group(group_name)
+    n = inv["n"]
+    pairs = np.array([(i, j) for i in range(n) for j in range(n)])
+    labels = np.array([T[i, j] for i, j in pairs])
+    X = np.zeros((n * n, 2 * n), dtype=np.float32)
+    X[np.arange(n * n), pairs[:, 0]] = 1.0
+    X[np.arange(n * n), n + pairs[:, 1]] = 1.0
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(n * n)
+    n_train = int(frac * n * n)
+    tr, va = perm[:n_train], perm[n_train:]
+    return (torch.tensor(X[tr]), torch.tensor(labels[tr]),
+            torch.tensor(X[va]), torch.tensor(labels[va]), n)
 
-def fs_verify_and_invariants():
-    inv = {}
-    for g in ORDER:
-        T, base = get_group(g)
-        n = base["n"]
-        dims = base["irrep_dims"]
-        eps = FS[g]
-        assert len(eps) == len(dims)
-        # classical identity: sum_rho eps_rho * d_rho = #{g in G : g^2 = e}
-        e = [x for x in range(n) if all(T[x, y] == y for y in range(n))][0]
-        sqrt_count = sum(1 for x in range(n) if T[x, x] == e)
-        assert sum(e_ * d for e_, d in zip(eps, dims)) == sqrt_count, g
-        base["sqrt_of_identity"] = sqrt_count
-        base["quaternionic_mass"] = sum(d * d for e_, d in zip(eps, dims) if e_ == -1) / n
-        inv[g] = base
-    return inv
 
-def _annotate(r):
-    h = r["history"]
-    r["T_mem_u"] = sustained(h["train_acc"], h["epoch"], 0.995)
-    r["T_gen_u"] = sustained(h["val_acc"], h["epoch"], THRESH)
-    r["max_epoch"] = h["epoch"][-1]
-    r["censored"] = r["T_gen_u"] is None
-    r["delay_u"] = None if r["censored"] else r["T_gen_u"] - r["T_mem_u"]
-    return r
+def train(group_name, seed, width=512, lr=2e-3, wd=1.0, max_epochs=40_000):
+    Xtr, ytr, Xva, yva, n = make_data(group_name, seed)
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(2 * n, width, bias=False), nn.ReLU(),
+                          nn.Linear(width, n, bias=False))
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.98),
+                            weight_decay=wd)
+    loss_fn = nn.CrossEntropyLoss()
+    stop = 0
+    for epoch in range(max_epochs + 1):
+        opt.zero_grad()
+        loss_fn(model(Xtr), ytr).backward()
+        opt.step()
+        if epoch % 100 == 0:
+            with torch.no_grad():
+                va = (model(Xva).argmax(1) == yva).float().mean().item()
+            stop = stop + 1 if va >= 0.99 else 0
+            if stop >= 8:
+                break
+    return model, (Xtr, ytr, Xva, yva), n, epoch
 
-def load_arch(prefix):
-    runs = {}
-    for path in sorted(glob.glob(f"results/{prefix}_*_seed*.json")):
-        d = json.load(open(path))
-        if "history" not in d:
-            continue          # skip diagnostics/ablation files in results/
-        r = _annotate(d)
-        runs.setdefault(r["group"], []).append(r)
-    return runs
 
-def load_runs():
-    runs = {g: [] for g in ORDER}
-    for path in sorted(glob.glob("results/*_seed*.json")):
-        if path.split("/")[-1].startswith(("CX_", "QT_", "ISO_")):
-            continue
-        d = json.load(open(path))
-        if "history" not in d:
-            continue          # skip diagnostics/ablation files in results/
-        r = _annotate(d)
-        runs[r["group"]].append(r)
-    return runs
+def accs(model, data):
+    Xtr, ytr, Xva, yva = data
+    with torch.no_grad():
+        ta = (model(Xtr).argmax(1) == ytr).float().mean().item()
+        va = (model(Xva).argmax(1) == yva).float().mean().item()
+    return ta, va
 
-def main():
-    inv = fs_verify_and_invariants()
-    runs = load_runs()
 
-    print(f"\n=== Grokking delay at matched |G|=24 (threshold: sustained val>={THRESH}) ===")
-    print(f"{'group':7s} {'k':>3s} {'d_max':>5s} {'q-mass':>6s} | "
-          f"{'delays (epochs)':30s} {'final val acc':>18s}")
-    rows = []
-    for g in ORDER:
-        i = inv[g]
-        ds, finals = [], []
-        for r in sorted(runs[g], key=lambda x: x["seed"]):
-            ds.append(f">{r['max_epoch'] - r['T_mem_u']}" if r["censored"]
-                      else str(r["delay_u"]))
-            finals.append(f"{r['final_val_acc']:.3f}")
-        print(f"{g:7s} {i['k']:3d} {i['d_max']:5d} {i['quaternionic_mass']:6.3f} | "
-              f"{', '.join(ds):30s} {', '.join(finals):>18s}")
-        rows.append((g, i, runs[g]))
+def projected_copy(model, n, P_remove):
+    m2 = nn.Sequential(*[nn.Linear(l.in_features, l.out_features, bias=False)
+                         if isinstance(l, nn.Linear) else nn.ReLU()
+                         for l in model])
+    m2.load_state_dict(model.state_dict())
+    Q = torch.tensor(np.eye(n) - P_remove, dtype=torch.float32)
+    with torch.no_grad():
+        W1 = m2[0].weight
+        W1[:, :n] = W1[:, :n] @ Q
+        W1[:, n:] = W1[:, n:] @ Q
+        m2[2].weight[:] = Q @ m2[2].weight
+    return m2
 
-    # ---------------------------------------------------------- figure 1
-    assert len(ORDER) == 6, f"fig1 grid assumes 6 groups, ORDER has {len(ORDER)}"
-    fig, axes = plt.subplots(2, 3, figsize=(13, 6.6), sharey=True)
-    for ax, g in zip(axes.flat, ORDER):
-        r = sorted(runs[g], key=lambda x: x["seed"])[0]
-        h = r["history"]
-        ax.plot(h["epoch"], h["train_acc"], "--", color="0.55", lw=1.2, label="train")
-        ax.plot(h["epoch"], h["val_acc"], color="C0", lw=1.6, label="val")
-        ax.axhline(THRESH, color="C3", lw=0.8, ls=":")
-        if r["T_gen_u"]:
-            ax.axvline(r["T_gen_u"], color="C3", lw=0.8)
-        ax.set_xscale("log"); ax.set_xlim(40, max(h["epoch"]))
-        ax.set_title(f"{LABEL[g]}   (k={inv[g]['k']}, d_max={inv[g]['d_max']}"
-                     + (", quaternionic" if inv[g]["quaternionic_mass"] > 0 else "")
-                     + ")", fontsize=10)
-        ax.set_ylim(0, 1.02)
-    axes[0, 0].legend(fontsize=8, loc="center left")
-    for ax in axes[1]: ax.set_xlabel("epoch (log)")
-    for ax in axes[:, 0]: ax.set_ylabel("accuracy")
-    fig.suptitle("Grokking on group composition: identical recipe, "
-                 "six groups of order 24", fontsize=11)
-    fig.tight_layout()
-    fig.savefig("figs/fig1_curves.png", dpi=160)
 
-    # ---------------------------------------------------------- figure 2
-    fig, ax = plt.subplots(figsize=(7.2, 4.4))
-    for xi, g in enumerate(ORDER):
-        i = inv[g]
-        for r in runs[g]:
-            if r["censored"]:
-                y = r["max_epoch"] - r["T_mem_u"]
-                ax.scatter(xi, y, marker="^", s=70, color="C3", zorder=3)
-                ax.annotate("censored", (xi, y), textcoords="offset points",
-                            xytext=(6, 2), fontsize=7, color="C3")
-            else:
-                ax.scatter(xi, r["delay_u"], s=45, color="C0", zorder=3)
-        obs = [r["delay_u"] for r in runs[g] if not r["censored"]]
-        if obs:
-            ax.hlines(np.mean(obs), xi - 0.18, xi + 0.18, color="C0", lw=2)
-    ax.set_yscale("log")
-    ax.set_xticks(range(len(ORDER)))
-    ax.set_xticklabels([f"{LABEL[g]}\nk={inv[g]['k']}, d_max={inv[g]['d_max']}\n"
-                        f"q={inv[g]['quaternionic_mass']:.2f}" for g in ORDER],
-                       fontsize=8.5)
-    ax.set_ylabel(f"grokking delay  T_gen({THRESH}) − T_mem  (epochs, log)")
-    ax.set_title("Delay varies 5–30×+ across six groups of identical order 24\n"
-                 "(non-monotone in k and d_max; both quaternionic-type groups are catastrophic)",
-                 fontsize=10)
-    fig.tight_layout()
-    fig.savefig("figs/fig2_delay.png", dpi=160)
+def sector_vec(model, n, P):
+    """Flattened weight components living in sector P (both arg slots + unembed)."""
+    Pt = torch.tensor(P, dtype=torch.float32)
+    W1, W2 = model[0].weight, model[2].weight
+    return torch.cat([(W1[:, :n] @ Pt).flatten(),
+                      (W1[:, n:] @ Pt).flatten(),
+                      (Pt @ W2).flatten()])
 
-    # ---------------------------------------------------------- figure 3
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    assert len(ORDER) == 6, f"fig3 palette assumes 6 groups, ORDER has {len(ORDER)}"
-    for g, c in zip(ORDER, ["C0", "C1", "C2", "C3", "C4", "C5"]):
-        r = sorted(runs[g], key=lambda x: x["seed"])[0]
-        h = r["history"]
-        ax.plot(h["epoch"], h["sqnorm"], color=c, lw=1.5, label=LABEL[g])
-    ax.set_xscale("log"); ax.set_xlim(40, None)
-    ax.set_xlabel("epoch (log)"); ax.set_ylabel(r"$\|\theta\|^2$")
-    ax.set_title("Weight-norm trajectories (seed 0): the norm-separation mediator\n"
-                 "weakens exactly where delay explodes", fontsize=10)
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    fig.savefig("figs/fig3_norms.png", dpi=160)
 
-    # ------------------------------------------- algebra sweep table + fig 4
-    archs = [("real", runs, "o", "C0"),
-             ("complex", load_arch("CX"), "s", "C1"),
-             ("quaternion", load_arch("QT"), "D", "C2")]
-    print("\n=== Weight-algebra sweep (all parameter-matched) ===")
-    for name, data, _, _ in archs[1:]:
-        for g in ORDER:
-            for r in sorted(data.get(g, []), key=lambda x: x["seed"]):
-                d = (f">{r['max_epoch'] - r['T_mem_u']}" if r["censored"]
-                     else str(r["delay_u"]))
-                print(f"{name:10s} {g:7s} seed {r['seed']}: delay {d:>8s}  "
-                      f"final {r['final_val_acc']:.3f}")
+def grad_balance(model, Xtr, ytr, n, sectors):
+    """cosine( P dL/dW , P W ) per sector, plus norm ratios vs the wd force."""
+    loss = nn.CrossEntropyLoss()(model(Xtr), ytr)
+    model.zero_grad()
+    loss.backward()
+    W1, W2 = model[0].weight, model[2].weight
+    G1, G2 = W1.grad, W2.grad
+    out = {}
+    for name, P in sectors.items():
+        Pt = torch.tensor(P, dtype=torch.float32)
+        w = torch.cat([(W1[:, :n] @ Pt).flatten(), (W1[:, n:] @ Pt).flatten(),
+                       (Pt @ W2).flatten()]).detach()
+        g = torch.cat([(G1[:, :n] @ Pt).flatten(), (G1[:, n:] @ Pt).flatten(),
+                       (Pt @ G2).flatten()]).detach()
+        cos = (g @ w / (g.norm() * w.norm() + 1e-12)).item()
+        out[name] = dict(cos_gw=round(cos, 4),
+                         g_norm=round(g.norm().item(), 5),
+                         w_norm=round(w.norm().item(), 3))
+    model.zero_grad()
+    return out
 
-    pair = ["D4xZ3", "Q8xZ3", "SL23"]
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.6, 4.2))
-    offs = {"real": -0.22, "complex": 0.0, "quaternion": 0.22}
-    for name, data, mk, col in archs:
-        for xi, g in enumerate(pair):
-            for r in data.get(g, []) if name != "real" else runs[g]:
-                y = (r["max_epoch"] - r["T_mem_u"]) if r["censored"] else r["delay_u"]
-                a1.scatter(xi + offs[name], y,
-                           marker="^" if r["censored"] else mk,
-                           s=50, color=col, zorder=3)
-                a2.scatter(xi + offs[name], r["final_val_acc"],
-                           marker=mk, s=50, color=col, zorder=3)
-    for ax in (a1, a2):
-        ax.set_xticks(range(len(pair)))
-        ax.set_xticklabels([LABEL[g] for g in pair], fontsize=9)
-    a1.set_yscale("log")
-    a1.set_ylabel("delay (epochs, log; ▲ = censored)")
-    a2.set_ylabel("final val accuracy"); a2.set_ylim(0.6, 1.02)
-    from matplotlib.lines import Line2D
-    a1.legend(handles=[Line2D([], [], marker=m, ls="", color=c, label=l)
-                       for l, (_, _, m, c) in zip(
-                           ["real", "complex", "quaternion"],
-                           [(0, 0, "o", "C0"), (0, 0, "s", "C1"), (0, 0, "D", "C2")])],
-              fontsize=8)
-    fig.suptitle("The failure is invariant under the weight algebra "
-                 "$\\mathbb{R} \\to \\mathbb{C} \\to \\mathbb{H}$ "
-                 "(parameter-matched; control unaffected)", fontsize=10)
-    fig.tight_layout()
-    fig.savefig("figs/fig4_algebra_sweep.png", dpi=160)
 
-    # --- budget audit: a ">N" delay is only comparable if N is the same
-    print("\n=== budget audit ===")
-    cens = {}
-    for g in ORDER:
-        for r in sorted(runs[g], key=lambda x: x["seed"]):
-            dec = r.get("max_epochs", "NOT RECORDED")
-            print(f"  {g:7s} s{r['seed']}  ran to {r['max_epoch']:7d}  "
-                  f"declared max_epochs={dec}  "
-                  f"{'CENSORED' if r['censored'] else 'grokked'}")
-            if r["censored"]:
-                cens.setdefault(r["max_epoch"], []).append(f"{g}s{r['seed']}")
-    if len(cens) > 1:
-        print(f"  WARNING: censored runs stopped at different budgets "
-              f"{ {k: v for k, v in sorted(cens.items())} };"
-              f" the '>N' delays are NOT comparable across those conditions.")
+def neuron_coupling(model, n, sectors):
+    """M[s,t] = sum_h a_s(h) * b_t(h), normalised. Off-diagonals = entanglement."""
+    W1 = model[0].weight.detach()
+    W2 = model[2].weight.detach()
+    names = list(sectors)
+    A = {}   # input energy per neuron per sector
+    B = {}   # output energy per neuron per sector
+    for name in names:
+        Pt = torch.tensor(sectors[name], dtype=torch.float32)
+        A[name] = ((W1[:, :n] @ Pt) ** 2).sum(1) + ((W1[:, n:] @ Pt) ** 2).sum(1)
+        B[name] = ((Pt @ W2) ** 2).sum(0)
+    M = np.zeros((len(names), len(names)))
+    for i, s in enumerate(names):
+        for j, t in enumerate(names):
+            M[i, j] = (A[s] * B[t]).sum().item()
+    M /= M.sum()
+    return names, np.round(M, 4)
 
-    print("\nfigures written to figs/")
+
+def energy_fracs(model, n, sectors):
+    tot = sum(sector_vec(model, n, P).norm().item() ** 2 for P in sectors.values())
+    return {k: round(sector_vec(model, n, P).norm().item() ** 2 / tot, 4)
+            for k, P in sectors.items()}
+
+
+def regrow(model, data, n, P_villain, sectors, lr=2e-3, wd=1.0, epochs=6000):
+    """Project villain out, resume training, watch its energy and val acc."""
+    m2 = projected_copy(model, n, P_villain)
+    Xtr, ytr, Xva, yva = data
+    opt = torch.optim.AdamW(m2.parameters(), lr=lr, betas=(0.9, 0.98),
+                            weight_decay=wd)
+    loss_fn = nn.CrossEntropyLoss()
+    log = []
+    for epoch in range(epochs + 1):
+        if epoch % 500 == 0:
+            ta, va = accs(m2, data)
+            vfrac = energy_fracs(m2, n, sectors)
+            log.append((epoch, round(ta, 3), round(va, 3), vfrac))
+        opt.zero_grad()
+        loss_fn(m2(Xtr), ytr).backward()
+        opt.step()
+    return log
+
 
 if __name__ == "__main__":
-    main()
+    report = {}
+    for g in ["Q8xZ3", "D4xZ3"]:
+        t0 = time.time()
+        P_twin, P_pair, P_ones = build_pair_projector(g)
+        sectors = dict(ones=P_ones, twin=P_twin, pair=P_pair)
+        model, data, n, last_ep = train(g, seed=0)
+        Xtr, ytr, Xva, yva = data
+        ta, va = accs(model, data)
+        print(f"\n=== {g} (seed 0, stopped at epoch {last_ep}, "
+              f"train {ta:.3f} / val {va:.3f}, {time.time()-t0:.0f}s) ===")
+
+        # 1. full ablation matrix with TRAIN accuracy
+        mat = {}
+        for name, P in [("ones", P_ones), ("twin", P_twin), ("pair", P_pair),
+                        ("both2d", P_twin + P_pair)]:
+            m2 = projected_copy(model, n, P)
+            mat[f"minus_{name}"] = tuple(round(x, 3) for x in accs(m2, data))
+        mat["full"] = (round(ta, 3), round(va, 3))
+        print("ablation (train, val):", mat)
+
+        # 2. gradient balance per sector
+        gb = grad_balance(model, Xtr, ytr, n, sectors)
+        print("grad balance cos(P dL, P W):", gb)
+
+        # 3. weight-energy fractions (baseline: ones .5, twin 1/6, pair 1/3)
+        ef = energy_fracs(model, n, sectors)
+        print("energy fractions:", ef)
+
+        # 4. neuron-mediated coupling
+        names, M = neuron_coupling(model, n, sectors)
+        print("neuron coupling M[s_in, t_out] over", names)
+        print(M)
+
+        report[g] = dict(last_epoch=last_ep, train=ta, val=va, ablation=mat,
+                         grad_balance=gb, energy=ef,
+                         coupling=dict(names=names, M=M.tolist()))
+
+        # 5. regrowth test on the stuck net only
+        if g == "Q8xZ3":
+            print("regrowth after projecting out `pair` (epoch, train, val, energy):")
+            log = regrow(model, data, n, P_pair, sectors)
+            for row in log:
+                print("  ", row)
+            report[g]["regrowth"] = log
+
+    with open("results/diagnose_seed0.json", "w") as f:
+        json.dump(report, f, indent=1, default=str)
+    print("\nsaved -> results/diagnose_seed0.json")
